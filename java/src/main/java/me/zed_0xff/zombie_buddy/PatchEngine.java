@@ -1,7 +1,6 @@
 package me.zed_0xff.zombie_buddy;
 
 import java.lang.annotation.Annotation;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -39,24 +38,6 @@ public final class PatchEngine {
             Advice.OnMethodExit.class
             );
 
-    // arguments are "non-special"
-    private static final HashSet<Class<? extends Annotation>> ARGUMENT_ANNOTATIONS = new HashSet<>(List.of(
-            Advice.Argument.class,
-            net.bytebuddy.implementation.bind.annotation.Argument.class
-            ));
-
-    private static boolean isSpecialAnnotation(Annotation ann) {
-        var annType = ann.annotationType();
-        if (ARGUMENT_ANNOTATIONS.contains(annType)) {
-            return false;
-        }
-
-        String annTypeName = annType.getName();
-        boolean result = annTypeName.startsWith("net.bytebuddy.implementation.bind.annotation.") || annTypeName.startsWith("net.bytebuddy.asm.Advice");
-        // Logger.trace("isSpecialAnnotation: " + ann + " -> " + result);
-        return result;
-    }
-
     private static boolean isSpecialAnnotation(AnnotationDescription ann) {
         TypeDescription annType = ann.getAnnotationType();
         if (annType.represents(Advice.Argument.class)
@@ -69,42 +50,41 @@ public final class PatchEngine {
         return result;
     }
 
-    private static Method findMethodWithAnnotation(Class<?> clazz, Class<? extends Annotation> annType) {
-        for (Method method : clazz.getDeclaredMethods()) {
-            if (method.isAnnotationPresent(annType)) {
+    private static MethodDescription findMethodWithAnnotation(TypeDescription type, Class<? extends Annotation> annType) {
+        for (MethodDescription method : type.getDeclaredMethods()) {
+            if (method.getDeclaredAnnotations().ofType(annType) != null) {
                 return method;
             }
         }
         return null;
     }
 
-    private static List<Class<?>> inferSignatureFromMethod(Method patchMethod) {
-        Annotation[][] paramAnns = patchMethod.getParameterAnnotations();
-        Class<?>[] paramTypes = patchMethod.getParameterTypes();
-        Map<Integer, Class<?>> argumentMap = new HashMap<>();
+    private static List<TypeDescription> inferSignatureFromMethod(MethodDescription patchMethod) {
+        Map<Integer, TypeDescription> argumentMap = new HashMap<>();
 
-        for (int i = 0; i < paramAnns.length; i++) {
+        int i = 0;
+        for (ParameterDescription param : patchMethod.getParameters()) {
             boolean isSpecial = false;
-            int argumentIndex = -1;
-
-            for (Annotation ann : paramAnns[i]) {
+            for (AnnotationDescription ann : param.getDeclaredAnnotations()) {
                 if (isSpecialAnnotation(ann)) {
                     isSpecial = true;
                     break;
                 }
-                // https://javadoc.io/static/net.bytebuddy/byte-buddy/1.18.8/net/bytebuddy/implementation/bind/annotation/Argument.html
-                if (ann instanceof net.bytebuddy.implementation.bind.annotation.Argument arg) {
-                    argumentIndex = arg.value();
-                    Class<?> paramType = paramTypes[i];
-                    argumentMap.put(argumentIndex, paramType.isArray() ? paramType.getComponentType() : paramType);
-                    break;
-                }
+            }
+            if (isSpecial) {
+                i++;
+                continue;
             }
 
-            if (isSpecial) continue;
-            if (argumentIndex == -1) {
-                argumentMap.put(i, paramTypes[i]);
+            AnnotationDescription.Loadable<net.bytebuddy.implementation.bind.annotation.Argument> arg =
+                    param.getDeclaredAnnotations().ofType(net.bytebuddy.implementation.bind.annotation.Argument.class);
+            TypeDescription paramType = param.getType().asErasure();
+            if (arg != null) {
+                argumentMap.put(arg.load().value(), paramType.isArray() ? paramType.getComponentType() : paramType);
+            } else {
+                argumentMap.put(i, paramType);
             }
+            i++;
         }
 
         if (argumentMap.isEmpty()) return null;
@@ -119,7 +99,7 @@ public final class PatchEngine {
         }
 
         if (hasCompleteSequence) {
-            List<Class<?>> sig = new ArrayList<>();
+            List<TypeDescription> sig = new ArrayList<>();
             for (int idx = 0; idx <= maxIndex; idx++) {
                 sig.add(argumentMap.get(idx));
             }
@@ -338,8 +318,8 @@ public final class PatchEngine {
                         if (methodName.equals("<init>")) {
                             try {
                                 // Infer constructor signature from delegation method's @Argument annotations
-                                Method delegationMethod = findMethodWithAnnotation(prepared.type(), RuntimeType.class);
-                                List<Class<?>> inferredConstructorSignature = null;
+                                MethodDescription delegationMethod = findMethodWithAnnotation(prepared.description(), RuntimeType.class);
+                                List<TypeDescription> inferredConstructorSignature = null;
                                 if (delegationMethod != null) {
                                     inferredConstructorSignature = inferSignatureFromMethod(delegationMethod);
                                 }
@@ -349,7 +329,7 @@ public final class PatchEngine {
                                 if (!Utils.isBlank(inferredConstructorSignature)) {
                                     // Match constructor with specific signature
                                     constructorMatcher = net.bytebuddy.matcher.ElementMatchers.isConstructor()
-                                        .and(net.bytebuddy.matcher.ElementMatchers.takesArguments(inferredConstructorSignature.toArray(new Class<?>[0])));
+                                        .and(net.bytebuddy.matcher.ElementMatchers.takesArguments(inferredConstructorSignature));
                                 } else {
                                     // No signature inferred, match all constructors (fallback)
                                     constructorMatcher = net.bytebuddy.matcher.ElementMatchers.isConstructor();
@@ -361,7 +341,7 @@ public final class PatchEngine {
                                 result = result
                                     .constructor(constructorMatcher)
                                     .intercept(MethodCall.invoke(objectConstructor)
-                                        .andThen(MethodDelegation.to(prepared.type())));
+                                        .andThen(MethodDelegation.to(prepared.description())));
                             } catch (Throwable t) {
                                 Logger.error("ERROR: Could not set up constructor delegation: " + t.getMessage());
                                 if (Loader.g_verbosity > 0) {
@@ -370,12 +350,12 @@ public final class PatchEngine {
                                 // Fallback to SuperMethodCall
                                 result = result
                                     .constructor(ElementMatchers.any())
-                                    .intercept(SuperMethodCall.INSTANCE.andThen(MethodDelegation.to(prepared.type())));
+                                    .intercept(SuperMethodCall.INSTANCE.andThen(MethodDelegation.to(prepared.description())));
                             }
                         } else {
                             result = result
                                 .method(SyntaxSugar.methodMatcher(methodName))
-                                .intercept(MethodDelegation.to(prepared.type()));
+                                .intercept(MethodDelegation.to(prepared.description()));
                         }
                     }
                     
